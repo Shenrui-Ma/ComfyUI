@@ -161,6 +161,18 @@ def _snapshot_progress(state: _ScanState) -> Progress:
     )
 
 
+# The fast scan inserts INSERT_BATCH_SIZE files per write transaction and pauses before
+# the next, so an upload or an output being registered gets the write lock. A write
+# waiting in SQLite's busy handler polls with sleeps of up to 100 ms (a little longer on
+# Windows' coarse timer), so a shorter pause can fall between its polls. On a slow disk a
+# batch holds the lock longer and more writes queue behind it, so the pause grows with the
+# batch, up to a cap: a batch's time also counts stat and hashing done before its write.
+INSERT_BATCH_SIZE = 200
+INSERT_PAUSE_SECONDS = 0.12
+INSERT_PAUSE_RATIO = 0.25
+INSERT_PAUSE_MAX_SECONDS = 0.5
+
+
 class _AssetSeeder:
     """Background asset scanning manager.
 
@@ -985,11 +997,10 @@ class _AssetSeeder:
         if self._check_pause_and_cancel(_ScanStage.FAST_SCAN):
             return total_created, skipped_existing, total_paths
 
-        batch_size = 500
         last_progress_time = time.perf_counter()
         progress_interval = 1.0
 
-        for i in range(0, len(specs), batch_size):
+        for i in range(0, len(specs), INSERT_BATCH_SIZE):
             if self._check_pause_and_cancel(_ScanStage.FAST_SCAN):
                 logging.info(
                     "Fast scan cancelled after %d/%d files (created=%d)",
@@ -999,9 +1010,10 @@ class _AssetSeeder:
                 )
                 return total_created, skipped_existing, total_paths
 
-            batch = specs[i : i + batch_size]
+            batch = specs[i : i + INSERT_BATCH_SIZE]
             batch_tags = {t for spec in batch for t in spec["tags"]}
             created = 0
+            batch_started = time.perf_counter()
             try:
                 created, batch_error = insert_asset_specs(batch, batch_tags, scan_state)
                 total_created += created
@@ -1042,6 +1054,10 @@ class _AssetSeeder:
                     },
                 )
                 last_progress_time = now
+
+            if scanned < len(specs):
+                pause = INSERT_PAUSE_RATIO * (now - batch_started)
+                time.sleep(min(max(pause, INSERT_PAUSE_SECONDS), INSERT_PAUSE_MAX_SECONDS))
 
         self._update_progress(scanned=len(specs), created=total_created)
         tick_watch_list(scan_state)
